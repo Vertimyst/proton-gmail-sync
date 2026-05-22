@@ -13,7 +13,8 @@ Actions synced every run:
 Messages are matched by Message-ID header. Only Gmail INBOX messages
 are affected — already-organised Gmail messages are left alone.
 
-No cache needed. Every run is fully self-contained.
+Gmail INBOX is indexed once per run for fast in-memory matching,
+avoiding slow per-message IMAP searches.
 
 SETUP (one-time):
   1. Install dependencies:
@@ -164,7 +165,7 @@ def fetch_proton_folder_message_ids(proton, label_id: str, label_name: str,
     return ids
 
 
-def fetch_proton_custom_folders(proton, log: logging.Logger) -> list[dict]:
+def fetch_proton_custom_folders(proton, log: logging.Logger) -> list:
     """
     Return list of custom Proton folders (non-system labels).
     Each entry: {"id": str, "name": str}
@@ -190,12 +191,45 @@ def gmail_connect(cfg: dict, log: logging.Logger) -> imaplib.IMAP4_SSL:
     return conn
 
 
-def gmail_find_inbox_uid(conn: imaplib.IMAP4_SSL, message_id: str) -> bytes | None:
-    """Search Gmail INBOX for a message by Message-ID. Returns UID or None."""
-    conn.select("INBOX")
-    _, data = conn.uid("SEARCH", None, f'HEADER Message-ID "{message_id}"')
+def gmail_fetch_inbox_index(conn: imaplib.IMAP4_SSL, log: logging.Logger) -> dict:
+    """
+    Fetch all Message-IDs from Gmail INBOX once and return a dict of
+    {message_id: uid} for fast in-memory lookup. This avoids doing a
+    separate IMAP search for every message.
+    """
+    conn.select("INBOX", readonly=True)
+    _, data = conn.uid("SEARCH", None, "ALL")
     uids = data[0].split() if data[0] else []
-    return uids[0] if uids else None
+    if not uids:
+        log.info("Gmail INBOX is empty.")
+        return {}
+
+    log.info("Building Gmail INBOX index (%d messages)...", len(uids))
+    index = {}
+    batch_size = 100
+
+    for i in range(0, len(uids), batch_size):
+        batch = b",".join(uids[i:i + batch_size])
+        _, fetch_data = conn.uid(
+            "FETCH", batch, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID)])"
+        )
+        current_uid = None
+        for item in fetch_data:
+            if isinstance(item, tuple):
+                try:
+                    uid_str = item[0].decode().split("UID ")[1].split(" ")[0].strip(")")
+                    current_uid = uid_str.encode()
+                except (IndexError, AttributeError):
+                    continue
+                for line in item[1].decode(errors="ignore").splitlines():
+                    if line.lower().startswith("message-id:"):
+                        mid = line.split(":", 1)[1].strip()
+                        if mid and current_uid:
+                            index[mid] = current_uid
+                        break
+
+    log.info("Gmail INBOX index built: %d messages with Message-IDs.", len(index))
+    return index
 
 
 def gmail_list_labels(conn: imaplib.IMAP4_SSL) -> set:
@@ -204,7 +238,6 @@ def gmail_list_labels(conn: imaplib.IMAP4_SSL) -> set:
     labels = set()
     for f in folders:
         decoded = f.decode()
-        # Label name is after the last quote or delimiter
         parts = decoded.split('"/"')
         if len(parts) >= 2:
             name = parts[-1].strip().strip('"')
@@ -212,24 +245,17 @@ def gmail_list_labels(conn: imaplib.IMAP4_SSL) -> set:
     return labels
 
 
-def gmail_create_label(conn: imaplib.IMAP4_SSL, label_name: str,
-                        log: logging.Logger) -> bool:
-    """Create a Gmail label if it doesn't exist."""
-    result, _ = conn.create(label_name)
-    if result == "OK":
-        log.info("Created Gmail label: %s", label_name)
-        return True
-    else:
-        log.warning("Failed to create Gmail label: %s", label_name)
-        return False
-
-
 def gmail_ensure_label(conn: imaplib.IMAP4_SSL, label_name: str,
                         existing_labels: set, log: logging.Logger) -> bool:
     """Create Gmail label if it doesn't already exist. Returns True if usable."""
     if label_name.lower() in existing_labels:
         return True
-    return gmail_create_label(conn, label_name, log)
+    result, _ = conn.create(label_name)
+    if result == "OK":
+        log.info("Created Gmail label: %s", label_name)
+        return True
+    log.warning("Failed to create Gmail label: %s", label_name)
+    return False
 
 
 def gmail_move_to_trash(conn: imaplib.IMAP4_SSL, uid: bytes,
@@ -266,9 +292,8 @@ def gmail_move_to_spam(conn: imaplib.IMAP4_SSL, uid: bytes,
 
 def gmail_archive(conn: imaplib.IMAP4_SSL, uid: bytes,
                    log: logging.Logger) -> bool:
-    """Archive a Gmail INBOX message (remove INBOX label, keep in All Mail)."""
+    """Archive a Gmail INBOX message (remove from INBOX, keep in All Mail)."""
     try:
-        # Gmail archive = copy to All Mail, delete from INBOX
         res, _ = conn.uid("COPY", uid, "[Gmail]/All Mail")
         if res != "OK":
             log.warning("COPY to All Mail failed for UID %s", uid.decode())
@@ -283,17 +308,12 @@ def gmail_archive(conn: imaplib.IMAP4_SSL, uid: bytes,
 
 def gmail_apply_label(conn: imaplib.IMAP4_SSL, uid: bytes, label_name: str,
                        log: logging.Logger) -> bool:
-    """
-    Apply a label to a Gmail INBOX message and remove it from INBOX.
-    This effectively moves it to that label/folder.
-    """
+    """Apply a label to a Gmail INBOX message and remove it from INBOX."""
     try:
-        # Copy to label folder
         res, _ = conn.uid("COPY", uid, label_name)
         if res != "OK":
             log.warning("COPY to label '%s' failed for UID %s", label_name, uid.decode())
             return False
-        # Remove from INBOX
         conn.uid("STORE", uid, "+FLAGS", "(\\Deleted)")
         conn.expunge()
         return True
@@ -304,15 +324,19 @@ def gmail_apply_label(conn: imaplib.IMAP4_SSL, uid: bytes, label_name: str,
 
 
 # ---------------------------------------------------------------------------
-# Sync logic
+# Core sync logic
 # ---------------------------------------------------------------------------
 
 def process_folder(proton, gmail: imaplib.IMAP4_SSL, label_id: str,
                    label_name: str, action, page_size: int,
-                   dry_run: bool, log: logging.Logger) -> tuple[int, int, int]:
+                   inbox_index: dict, dry_run: bool,
+                   log: logging.Logger) -> tuple:
     """
-    Fetch messages from a Proton folder, find matching Gmail INBOX messages,
-    and apply the given action function to each.
+    Fetch messages from a Proton folder, match against the Gmail INBOX index,
+    and apply the given action to each match.
+
+    Matched messages are removed from inbox_index so subsequent folder passes
+    don't attempt to act on already-moved messages.
 
     Returns (actioned, not_found, errors).
     """
@@ -323,14 +347,14 @@ def process_folder(proton, gmail: imaplib.IMAP4_SSL, label_id: str,
         return 0, 0, 0
 
     actioned = not_found = errors = 0
-    gmail.select("INBOX")
+    gmail.select("INBOX")  # Select once per folder, not per message
 
     for mid in message_ids:
+        uid = inbox_index.get(mid)
+        if not uid:
+            not_found += 1
+            continue
         try:
-            uid = gmail_find_inbox_uid(gmail, mid)
-            if not uid:
-                not_found += 1
-                continue
             if dry_run:
                 log.info("[DRY RUN] Would apply '%s' to: %s", label_name, mid)
                 actioned += 1
@@ -339,6 +363,8 @@ def process_folder(proton, gmail: imaplib.IMAP4_SSL, label_id: str,
             if success:
                 log.info("%-12s → applied to Gmail: %s", label_name, mid)
                 actioned += 1
+                # Remove from index so later folders don't try to re-process it
+                del inbox_index[mid]
             else:
                 errors += 1
         except Exception as e:
@@ -355,9 +381,15 @@ def run_sync(dry_run: bool, log: logging.Logger) -> None:
     # Connect to Proton
     proton = proton_load_session(proton_cfg, log)
 
-    # Connect to Gmail
+    # Connect to Gmail and build inbox index once upfront
     gmail = gmail_connect(gmail_cfg, log)
     existing_gmail_labels = gmail_list_labels(gmail)
+    inbox_index = gmail_fetch_inbox_index(gmail, log)
+
+    if not inbox_index:
+        log.info("Gmail INBOX is empty — nothing to sync.")
+        gmail.logout()
+        return
 
     totals = {"actioned": 0, "not_found": 0, "errors": 0}
 
@@ -373,6 +405,7 @@ def run_sync(dry_run: bool, log: logging.Logger) -> None:
         label_name="Trash",
         action=gmail_move_to_trash,
         page_size=proton_cfg["page_size"],
+        inbox_index=inbox_index,
         dry_run=dry_run, log=log,
     ))
 
@@ -383,6 +416,7 @@ def run_sync(dry_run: bool, log: logging.Logger) -> None:
         label_name="Spam",
         action=gmail_move_to_spam,
         page_size=proton_cfg["page_size"],
+        inbox_index=inbox_index,
         dry_run=dry_run, log=log,
     ))
 
@@ -393,6 +427,7 @@ def run_sync(dry_run: bool, log: logging.Logger) -> None:
         label_name="Archive",
         action=gmail_archive,
         page_size=proton_cfg["page_size"],
+        inbox_index=inbox_index,
         dry_run=dry_run, log=log,
     ))
 
@@ -400,13 +435,11 @@ def run_sync(dry_run: bool, log: logging.Logger) -> None:
     custom_folders = fetch_proton_custom_folders(proton, log)
     for folder in custom_folders:
         folder_name = folder["name"]
-        # Ensure Gmail label exists
         if not dry_run:
-            gmail_ensure_label(gmail, folder_name, existing_gmail_labels, log)
-            # Refresh label list in case we just created one
-            existing_gmail_labels = gmail_list_labels(gmail)
+            if gmail_ensure_label(gmail, folder_name, existing_gmail_labels, log):
+                existing_gmail_labels.add(folder_name.lower())
 
-        def make_label_action(lname):
+        def make_action(lname):
             def action(conn, uid, log):
                 return gmail_apply_label(conn, uid, lname, log)
             return action
@@ -415,8 +448,9 @@ def run_sync(dry_run: bool, log: logging.Logger) -> None:
             proton, gmail,
             label_id=folder["id"],
             label_name=folder_name,
-            action=make_label_action(folder_name),
+            action=make_action(folder_name),
             page_size=proton_cfg["page_size"],
+            inbox_index=inbox_index,
             dry_run=dry_run, log=log,
         ))
 
