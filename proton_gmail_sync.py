@@ -41,6 +41,7 @@ import imaplib
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -64,6 +65,32 @@ CONFIG = {
     },
     "log_level": "INFO",
     "log_file": "/home/vertimyst/mail-sync/mail-sync.log",
+    # Only sync messages newer than this many days. Keeps runs fast by
+    # ignoring historical backlogs in large folders like Trash and Archive.
+    "sync_days": 7,
+
+    # Proton folders to skip during sync (exact names, case-sensitive).
+    # Add any historical or irrelevant folders here.
+    "excluded_folders": [
+        "gmail.com 19-05-2026 09:45",
+        "Geek Chic Daily",
+        "PCMech Newsletter",
+        "PCMech Tip",
+        "[IBM] Internet Business Mastery",
+        "Arch Linux News",
+        "Healthy Mind and Body",
+        "Isagenix Event Tickets",
+        "NaNoWriMo",
+        "Shadowserve Registration",
+        "Conversation History",
+        "[erica.biz]",
+        "Innohosting",
+        "Innohosting Billing",
+        "Innohosting Invoice Notifications",
+        "SCF",
+        "SCF Mentor"
+
+    ],
 }
 
 # Proton system label IDs
@@ -78,7 +105,7 @@ PROTON_LABELS = {
 # ---------------------------------------------------------------------------
 
 
-def setup_logging(level_str: str, log_file: str) -> logging.Logger:
+def setup_logging(level_str: str, log_file: str, verbose: bool = False) -> logging.Logger:
     level = getattr(logging, level_str.upper(), logging.INFO)
     formatter = logging.Formatter(
         fmt="%(asctime)s [%(levelname)s] %(message)s",
@@ -87,13 +114,13 @@ def setup_logging(level_str: str, log_file: str) -> logging.Logger:
     logger = logging.getLogger("proton_gmail_sync")
     logger.setLevel(level)
 
-    # stderr only for WARNING+ (triggers cron email on errors)
-    console = logging.StreamHandler(sys.stderr)
+    # Console: INFO+ when verbose (dry-run/login), WARNING+ otherwise
+    console = logging.StreamHandler(sys.stdout)
     console.setFormatter(formatter)
-    console.setLevel(logging.WARNING)
+    console.setLevel(logging.INFO if verbose else logging.WARNING)
     logger.addHandler(console)
 
-    # File handler for all levels
+    # File handler always gets everything
     fh = logging.FileHandler(log_file)
     fh.setFormatter(formatter)
     logger.addHandler(fh)
@@ -145,23 +172,31 @@ def fetch_proton_folder_message_ids(proton, label_id: str, label_name: str,
     """
     ids = set()
     page = 0
+    since = int(time.time()) - (CONFIG["sync_days"] * 86400)
+
     while True:
         r = proton.session.get(
             "https://mail.proton.me/api/mail/v4/messages",
-            params={"Page": page, "PageSize": page_size, "LabelID": label_id},
+            params={
+                "Page": page,
+                "PageSize": page_size,
+                "LabelID": label_id,
+                "Begin": since,
+            },
         )
         data = r.json()
         messages = data.get("Messages", [])
         if not messages:
             break
         for msg in messages:
-            mid = msg.get("ExternalID", "").strip()
+            mid = (msg.get("ExternalID") or "").strip()
             if mid:
                 ids.add(mid)
         if len(messages) < page_size:
             break
         page += 1
-    log.info("Proton %-12s → %d messages with Message-IDs.", label_name, len(ids))
+    log.info("Proton %-12s → %d messages with Message-IDs (last %d days).",
+             label_name, len(ids), CONFIG["sync_days"])
     return ids
 
 
@@ -223,7 +258,7 @@ def gmail_fetch_inbox_index(conn: imaplib.IMAP4_SSL, log: logging.Logger) -> dic
                     continue
                 for line in item[1].decode(errors="ignore").splitlines():
                     if line.lower().startswith("message-id:"):
-                        mid = line.split(":", 1)[1].strip()
+                        mid = line.split(":", 1)[1].strip().strip("<>")
                         if mid and current_uid:
                             index[mid] = current_uid
                         break
@@ -433,7 +468,11 @@ def run_sync(dry_run: bool, log: logging.Logger) -> None:
 
     # 4. Proton custom folders → Gmail labels
     custom_folders = fetch_proton_custom_folders(proton, log)
+    excluded = set(CONFIG.get("excluded_folders", []))
     for folder in custom_folders:
+        if folder["name"] in excluded:
+            log.info("Skipping excluded folder: %s", folder["name"])
+            continue
         folder_name = folder["name"]
         if not dry_run:
             if gmail_ensure_label(gmail, folder_name, existing_gmail_labels, log):
@@ -480,7 +519,8 @@ def main():
     )
     args = parser.parse_args()
 
-    log = setup_logging(CONFIG["log_level"], CONFIG["log_file"])
+    log = setup_logging(CONFIG["log_level"], CONFIG["log_file"],
+                        verbose=args.dry_run or args.login)
 
     if args.login:
         log.info("=== Interactive Proton login ===")
