@@ -160,8 +160,31 @@ def proton_load_session(cfg: dict, log: logging.Logger):
         sys.exit(1)
     proton = ProtonMail()
     proton.load_session(session_path, auto_save=True)
+    # Proactively refresh and save the session on every run
+    try:
+        proton.save_session(session_path)
+    except Exception as e:
+        log.warning("Could not refresh session token: %s", e)
     log.info("Proton session loaded.")
     return proton
+
+
+def proton_check_session(proton, cfg: dict, log: logging.Logger) -> bool:
+    """
+    Verify the Proton session is valid by making a lightweight API call.
+    If a 401 is returned, log an error and return False.
+    Returns True if the session is healthy.
+    """
+    r = proton.session.get("https://mail.proton.me/api/core/v4/users")
+    if r.status_code == 401:
+        log.error(
+            "Proton session expired (401). Run: venv/bin/python3 proton_gmail_sync.py --login"
+        )
+        return False
+    if r.status_code != 200:
+        log.error("Unexpected Proton API response: %d", r.status_code)
+        return False
+    return True
 
 
 def fetch_proton_folder_message_ids(proton, label_id: str, label_name: str,
@@ -329,7 +352,7 @@ def gmail_archive(conn: imaplib.IMAP4_SSL, uid: bytes,
                    log: logging.Logger) -> bool:
     """Archive a Gmail INBOX message (remove from INBOX, keep in All Mail)."""
     try:
-        res, _ = conn.uid("COPY", uid, "[Gmail]/All Mail")
+        res, _ = conn.uid("COPY", uid, "\"[Gmail]/All Mail\"")
         if res != "OK":
             log.warning("COPY to All Mail failed for UID %s", uid.decode())
             return False
@@ -413,8 +436,10 @@ def run_sync(dry_run: bool, log: logging.Logger) -> None:
     proton_cfg = CONFIG["proton"]
     gmail_cfg = CONFIG["gmail"]
 
-    # Connect to Proton
+    # Connect to Proton and verify session is valid
     proton = proton_load_session(proton_cfg, log)
+    if not proton_check_session(proton, proton_cfg, log):
+        sys.exit(1)
 
     # Connect to Gmail and build inbox index once upfront
     gmail = gmail_connect(gmail_cfg, log)
