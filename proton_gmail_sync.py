@@ -303,17 +303,24 @@ def gmail_list_labels(conn: imaplib.IMAP4_SSL) -> set:
     return labels
 
 
+log.info("Ensuring Gmail label exists: %s", folder_name)
+        if gmail_ensure_label(gmail, folder_name, existing_gmail_labels, log):
+
 def gmail_ensure_label(conn: imaplib.IMAP4_SSL, label_name: str,
                         existing_labels: set, log: logging.Logger) -> bool:
     """Create Gmail label if it doesn't already exist. Returns True if usable."""
     if label_name.lower() in existing_labels:
         return True
-    result, _ = conn.create(label_name)
-    if result == "OK":
-        log.info("Created Gmail label: %s", label_name)
-        return True
-    log.warning("Failed to create Gmail label: %s", label_name)
-    return False
+    try:
+        result, _ = conn.create(f'"{label_name}"')
+        if result == "OK":
+            log.info("Created Gmail label: %s", label_name)
+            return True
+        log.warning("Failed to create Gmail label: %s", label_name)
+        return False
+    except imaplib.IMAP4.error as e:
+        log.warning("Could not create Gmail label '%s': %s", label_name, e)
+        return False
 
 
 def gmail_move_to_trash(conn: imaplib.IMAP4_SSL, uid: bytes,
